@@ -63,6 +63,22 @@ def clean_text(text):
         flags=re.IGNORECASE,
     )
 
+    # OCR occasionally splits a course code's digits across a
+    # stray space (e.g. "ECC404" -> "ECC40 4", "ECE710" ->
+    # "ECE71 0"), which then reads as a 2-digit code plus an
+    # unrelated leading digit stuck onto the title ("4
+    # Microelectronic Circuits" instead of "Microelectronic
+    # Circuits"). Squash it back together - but only when the
+    # lone extra digit is immediately followed by a title-case
+    # word, not by another number (a genuine L/T/S/C/H column
+    # sequence right after a real 2-digit code, e.g. "MAC01 3
+    # 1 0 4 4", must be left alone).
+    text = re.sub(
+        r"\b([A-Z]{2,5}\d{1,3})\s+(\d{1,2})(?=\s+[A-Z][a-z])",
+        r"\1\2",
+        text,
+    )
+
     text = re.sub(
         r"[ \t]+",
         " ",

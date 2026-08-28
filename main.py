@@ -876,6 +876,34 @@ def normalize_course_code(code):
 # COURSE RETRIEVAL
 # =========================================================
 
+# PDF OCR sometimes injects a stray space/newline inside a
+# course code itself (e.g. "ECC302" -> "ECC3 02"), not just
+# between its letter and digit runs - the same kind of
+# artifact already handled elsewhere for words like
+# "Electiv e" or "Laborator y". COURSE_CODE_PATTERN's regex
+# can't detect a code broken up like that at all, so build a
+# fully whitespace-tolerant version of one specific code here
+# for the places that need to find a code regardless of where
+# the PDF happened to break it.
+def build_code_pattern(code):
+
+    return r"\s*".join(
+        re.escape(character)
+        for character in code
+    )
+
+
+def code_appears_in_text(code, text):
+
+    return bool(
+        re.search(
+            r"\b" + build_code_pattern(code) + r"\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def looks_like_course_header(
     code,
     text,
@@ -883,8 +911,8 @@ def looks_like_course_header(
 
     return bool(
         re.search(
-            re.escape(code)
-            + r".{0,40}?\b(PCR|PEL)\b",
+            build_code_pattern(code)
+            + r".{0,90}?\b(PCR|PEL)\b",
             text,
             re.IGNORECASE | re.DOTALL,
         )
@@ -944,9 +972,19 @@ def extend_with_continuation_chunks(
 
         candidate = all_documents[position]
 
+        # A course's entry can run past the end of its
+        # starting page (e.g. XEC02's own textbooks/reference
+        # material land on the following page, after its
+        # course-outcome mapping table) - allow the walk to
+        # cross onto later pages too, not just stay within
+        # seed_page. Still capped at a handful of pages so a
+        # long run of untagged "GENERAL" pages can't wander
+        # arbitrarily far past this course's real entry.
         if (
             candidate.metadata.get("page")
-            != seed_page
+            is None
+            or candidate.metadata.get("page")
+            > seed_page + 3
         ):
             break
 
@@ -1044,7 +1082,13 @@ def retrieve_course_documents(
             for code in text_codes
         ]
 
-        if course_code in normalized_codes:
+        if (
+            course_code in normalized_codes
+            or code_appears_in_text(
+                course_code,
+                document.page_content,
+            )
+        ):
 
             matching_documents.append(
                 document
@@ -1081,6 +1125,81 @@ def retrieve_course_documents(
             matching_documents.append(
                 document
             )
+
+    # A bare text-scan match is only trustworthy as the
+    # course's OWN content if it looks like that course's
+    # real header row. Otherwise it's almost always just a
+    # citation inside some OTHER course's prerequisites list
+    # (e.g. XEC02, a very commonly required prerequisite,
+    # pulled in dozens of unrelated courses' chunks this way
+    # before this filter existed). Method 1's exact-tagged
+    # chunks are always trusted, since ingestion only tags a
+    # page with a specific code when that page had exactly
+    # one code on it - but that single-code detection can
+    # itself be wrong (an OCR-mangled neighbouring code can
+    # drop out of the scan, leaving this code as the page's
+    # only detected match even though the page is actually
+    # about a DIFFERENT course that merely cites this one as
+    # a prerequisite - this happened for XEC02 on a page that
+    # was really the tail of ECC301 / start of ECC302). So
+    # only trust a whole exact-tagged page if it isn't showing
+    # the classic mistag signature: the code cited near
+    # "prerequisites" wording SOMEWHERE on the page, with no
+    # chunk on that same page genuinely being this course's own
+    # header row. A legitimate continuation-only page (this
+    # course's header printed on an earlier page, this page
+    # just carries later syllabus/textbook content with no
+    # repeat of the code at all) shows neither signal, so it
+    # stays trusted; only a real prerequisite-citation mistag
+    # like XEC02's page 32 (ECC302's own prerequisites field
+    # naming XEC02, with no XEC02 header anywhere on that page)
+    # gets excluded.
+    exact_pages = {
+        document.metadata.get("page")
+        for document in exact_match_documents
+    }
+
+    exact_pass_pages = set()
+
+    for page in exact_pages:
+
+        page_documents = [
+            document
+            for document in exact_match_documents
+            if document.metadata.get("page")
+            == page
+        ]
+
+        has_header = any(
+            looks_like_course_header(
+                course_code,
+                document.page_content,
+            )
+            for document in page_documents
+        )
+
+        has_prerequisite_citation = any(
+            is_likely_prerequisite_code(
+                course_code,
+                document.page_content,
+            )
+            for document in page_documents
+        )
+
+        if has_header or not has_prerequisite_citation:
+
+            exact_pass_pages.add(page)
+
+    matching_documents = [
+        document
+        for document in matching_documents
+        if document.metadata.get("page")
+        in exact_pass_pages
+        or looks_like_course_header(
+            course_code,
+            document.page_content,
+        )
+    ]
 
     if matching_documents:
 
@@ -2969,12 +3088,14 @@ def retrieve_course_syllabus_documents(
     # references list) and carries no syllabus signal of its
     # own; keep everything else by default.
 
+    # Only a pure CO/PO correlation grid counts as noise here.
+    # Textbooks/reference material used to be excluded too,
+    # but users asking for a course's topics/syllabus expect
+    # its reading list included alongside them, not stripped
+    # out.
     noise_markers = [
         "course articulation matrix",
         "mapping of co",
-        "text books,",
-        "reference material",
-        "reference books",
     ]
 
     signal_phrases = [
@@ -3386,6 +3507,7 @@ def build_prompt(
     course_code=None,
     group=None,
     semester_subject_mode=False,
+    syllabus_question=False,
 ):
 
     if semester_subject_mode:
@@ -3434,6 +3556,29 @@ IMPORTANT:
     a "Group" column, that column is authoritative: include
     every row regardless of its group value, this is expected
     and correct data, not conflicting or incomplete data.
+"""
+
+    elif course_code and syllabus_question:
+
+        special_instruction = """
+The user is asking specifically about this course's TOPICS
+COVERED / SYLLABUS - not for the course's full details.
+
+Different courses in this curriculum label their syllabus
+sections differently (some use "Module 1, Module 2...",
+others use "Unit I, Unit II..."). Reproduce whatever
+structure and labels the retrieved context actually uses -
+never invent or rename them.
+
+Answer with ONLY the full topics/syllabus section (every
+Module/Unit found, with its content) - not just the first one
+or two. Do not omit any module/unit just because the answer
+is getting long, and do not stop early.
+
+Do NOT include the course title, credit, prerequisites,
+course outcomes, or textbooks/reference material sections -
+the user did not ask for those here, so leave them out
+entirely rather than padding the answer with them.
 """
 
     elif course_code:
@@ -4292,6 +4437,7 @@ def answer_question(
         course_code=course_code,
         group=group,
         semester_subject_mode=semester_subject_mode,
+        syllabus_question=syllabus_question,
     )
 
     # =====================================================
@@ -4349,6 +4495,7 @@ def answer_question(
                     course_code=course_code,
                     group=group,
                     semester_subject_mode=semester_subject_mode,
+                    syllabus_question=syllabus_question,
                 )
 
                 response = llm.invoke(
